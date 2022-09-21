@@ -41,9 +41,6 @@ func (kl *Kubelet) providerRequiresNetworkingConfiguration() bool {
 // updatePodCIDR updates the pod CIDR in the runtime state if it is different
 // from the current CIDR. Return true if pod CIDR is actually changed.
 func (kl *Kubelet) updatePodCIDR(cidr string) (bool, error) {
-	kl.updatePodCIDRMux.Lock()
-	defer kl.updatePodCIDRMux.Unlock()
-
 	podCIDR := kl.runtimeState.podCIDR()
 
 	if podCIDR == cidr {
