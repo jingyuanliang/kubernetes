@@ -36,17 +36,23 @@ type imagePuller interface {
 
 var _, _ imagePuller = &parallelImagePuller{}, &serialImagePuller{}
 
+// Maximum number of image pull requests that can run parallelly.
+const maxParallelImagePullRequests = 10
+
 type parallelImagePuller struct {
 	imageService kubecontainer.ImageService
+	pullLimiter  chan struct{}
 }
 
 func newParallelImagePuller(imageService kubecontainer.ImageService) imagePuller {
-	return &parallelImagePuller{imageService}
+	return &parallelImagePuller{imageService, make(chan struct{}, maxParallelImagePullRequests)}
 }
 
 func (pip *parallelImagePuller) pullImage(spec kubecontainer.ImageSpec, pullSecrets []v1.Secret, pullChan chan<- pullResult, podSandboxConfig *runtimeapi.PodSandboxConfig) {
 	go func() {
+		pip.pullLimiter <- struct{}{}
 		imageRef, err := pip.imageService.PullImage(spec, pullSecrets, podSandboxConfig)
+		<-pip.pullLimiter
 		pullChan <- pullResult{
 			imageRef: imageRef,
 			err:      err,
@@ -54,8 +60,8 @@ func (pip *parallelImagePuller) pullImage(spec kubecontainer.ImageSpec, pullSecr
 	}()
 }
 
-// Maximum number of image pull requests than can be queued.
-const maxImagePullRequests = 10
+// Maximum number of image pull requests that can be queued for serial pulls.
+const maxSerialImagePullRequests = 10
 
 type serialImagePuller struct {
 	imageService kubecontainer.ImageService
@@ -63,7 +69,7 @@ type serialImagePuller struct {
 }
 
 func newSerialImagePuller(imageService kubecontainer.ImageService) imagePuller {
-	imagePuller := &serialImagePuller{imageService, make(chan *imagePullRequest, maxImagePullRequests)}
+	imagePuller := &serialImagePuller{imageService, make(chan *imagePullRequest, maxSerialImagePullRequests)}
 	go wait.Until(imagePuller.processImagePullRequests, time.Second, wait.NeverStop)
 	return imagePuller
 }
