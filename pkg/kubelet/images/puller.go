@@ -17,6 +17,7 @@ limitations under the License.
 package images
 
 import (
+	"strings"
 	"time"
 
 	"k8s.io/api/core/v1"
@@ -60,10 +61,14 @@ const maxImagePullRequests = 10
 type serialImagePuller struct {
 	imageService kubecontainer.ImageService
 	pullRequests chan *imagePullRequest
+	pullRequestsHighPriority chan *imagePullRequest
 }
 
 func newSerialImagePuller(imageService kubecontainer.ImageService) imagePuller {
-	imagePuller := &serialImagePuller{imageService, make(chan *imagePullRequest, maxImagePullRequests)}
+	imagePuller := &serialImagePuller{imageService,
+		make(chan *imagePullRequest, maxImagePullRequests),
+		make(chan *imagePullRequest, maxImagePullRequests),
+	}
 	go wait.Until(imagePuller.processImagePullRequests, time.Second, wait.NeverStop)
 	return imagePuller
 }
@@ -76,16 +81,42 @@ type imagePullRequest struct {
 }
 
 func (sip *serialImagePuller) pullImage(spec kubecontainer.ImageSpec, pullSecrets []v1.Secret, pullChan chan<- pullResult, podSandboxConfig *runtimeapi.PodSandboxConfig) {
-	sip.pullRequests <- &imagePullRequest{
+	req := &imagePullRequest{
 		spec:             spec,
 		pullSecrets:      pullSecrets,
 		pullChan:         pullChan,
 		podSandboxConfig: podSandboxConfig,
 	}
+	if strings.Contains(spec.Image, "netd-init") || strings.Contains(spec.Image, "cilium") {
+		sip.pullRequestsHighPriority <- req
+	} else {
+		sip.pullRequests <- req
+	}
 }
 
 func (sip *serialImagePuller) processImagePullRequests() {
-	for pullRequest := range sip.pullRequests {
+	for {
+		var pullRequest *imagePullRequest
+
+		select {
+		case r := <- sip.pullRequestsHighPriority:
+			pullRequest = r
+		default:
+		}
+
+		if pullRequest == nil {
+			select {
+			case r := <- sip.pullRequestsHighPriority:
+				pullRequest = r
+			case r := <- sip.pullRequests:
+				pullRequest = r
+			}
+		}
+
+		if pullRequest == nil {
+			break
+		}
+
 		imageRef, err := sip.imageService.PullImage(pullRequest.spec, pullRequest.pullSecrets, pullRequest.podSandboxConfig)
 		pullRequest.pullChan <- pullResult{
 			imageRef: imageRef,
