@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -1896,6 +1897,104 @@ func TestDoesNotDeletePodDirsIfContainerIsRunning(t *testing.T) {
 	testKubelet.fakeRuntime.PodList = []*containertest.FakePod{}
 	testKubelet.kubelet.podWorkers.(*fakePodWorkers).running = nil
 	syncAndVerifyPodDir(t, testKubelet, pods, []*v1.Pod{apiPod}, false)
+}
+
+func TestFastStatusUpdateOnce(t *testing.T) {
+	tests := []struct {
+		name          string
+		exitOnSuccess bool
+	}{
+		{
+			name:          "exit on timeout",
+			exitOnSuccess: false,
+		},
+		{
+			name:          "exit on success",
+			exitOnSuccess: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
+			kubelet := testKubelet.kubelet
+			// Ensure we capture actions on the heartbeat client only.
+			// We don't set it to nil or GetNode() doesn't read from nodeLister.
+			kubelet.kubeClient = &fake.Clientset{}
+			kubeClient := testKubelet.fakeKubeClient
+
+			node := &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: string(kubelet.nodeName),
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:    v1.NodeReady,
+							Status:  v1.ConditionFalse,
+							Reason:  "NotReady",
+							Message: "Node not ready",
+						},
+					},
+				},
+			}
+
+			nodeLister := testNodeLister{[]*v1.Node{node.DeepCopy()}}
+
+			// Testing for the failure case: we want the first syncNodeStatus() to fail.
+			// With UpdateNodeStatusFromLister, it will try `nodeStatusUpdateRetry` patch actions before returning with error
+			// (one for lister GET, and four for apiserver GET for nodeStatusUpdateRetry = 5).
+			patchCount := 0
+			kubeClient.AddReactor("patch", "nodes", func(action core.Action) (bool, runtime.Object, error) {
+				patchCount++
+				if patchCount <= nodeStatusUpdateRetry {
+					return true, nil, fmt.Errorf("try again")
+				}
+				if tc.exitOnSuccess {
+					nodeLister.nodes[0].Status.Conditions[0].Status = v1.ConditionTrue
+				} else {
+					testKubelet.fakeClock.Step(2 * nodeReadyGracePeriod)
+				}
+				return false, nil, nil
+			})
+
+			kubelet.nodeLister = nodeLister
+
+			start := time.Now()
+			kubelet.fastStatusUpdateOnce()
+			assert.Less(t, time.Since(start), nodeReadyGracePeriod)
+
+			actions := kubeClient.Actions()
+			actionIsPatch := []bool{true}
+			for i := 1; i < nodeStatusUpdateRetry; i++ {
+				actionIsPatch = append(actionIsPatch, false, true)
+			}
+			actionIsPatch = append(actionIsPatch, true)
+			require.Len(t, actions, len(actionIsPatch))
+
+			for i, action := range actions {
+				if actionIsPatch[i] {
+					require.IsType(t, core.PatchActionImpl{}, action)
+				} else {
+					require.IsType(t, core.GetActionImpl{}, action)
+					continue
+				}
+				patchAction := action.(core.PatchActionImpl)
+
+				updatedNode, err := applyNodeStatusPatch(node, patchAction.GetPatch())
+				require.NoError(t, err)
+				seenNodeReady := false
+				for _, c := range updatedNode.Status.Conditions {
+					if c.Type == v1.NodeReady {
+						assert.Equal(t, v1.ConditionTrue, c.Status)
+						seenNodeReady = true
+					}
+				}
+				assert.True(t, seenNodeReady)
+			}
+		})
+	}
 }
 
 func TestGetPodsToSync(t *testing.T) {
