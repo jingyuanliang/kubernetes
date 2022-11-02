@@ -2459,17 +2459,50 @@ func (kl *Kubelet) fastStatusUpdateOnce() {
 
 	start := kl.clock.Now()
 
+	const (
+		GetNodeFromLister int = iota
+		GetNodeFromApiserverCache
+		GetNodeFromEtcd
+		GetNodeFromEtcdWithDelay
+	)
+
+	var node *v1.Node
+	nodeFrom := GetNodeFromLister
+
 	for {
 		time.Sleep(100 * time.Millisecond)
+
 		if kl.clock.Since(start) > nodeReadyGracePeriod {
 			klog.ErrorS(nil, "Node not becoming ready in time after startup")
 			return
 		}
-		node, err := kl.GetNode()
-		if err != nil {
-			klog.ErrorS(err, "Error getting node")
-			continue
+
+		for ; node == nil; nodeFrom++ {
+			klog.V(4).InfoS("Node is nil; need to re-fetch node", "nodeFrom", nodeFrom)
+
+			if nodeFrom == GetNodeFromLister {
+				nodeGot, err := kl.GetNode()
+				if err != nil {
+					klog.ErrorS(err, "Error getting node from lister")
+				} else {
+					node = nodeGot
+				}
+				continue
+			}
+
+			opts := metav1.GetOptions{}
+			if nodeFrom == GetNodeFromApiserverCache {
+				util.FromApiserverCache(&opts)
+			}
+
+			nodeGot, err := kl.heartbeatClient.CoreV1().Nodes().Get(context.TODO(), string(kl.nodeName), opts)
+			if err != nil {
+				klog.ErrorS(err, "Error getting node from apiserver", "nodeName", kl.nodeName)
+			} else {
+				node = nodeGot
+			}
 		}
+
 		for _, c := range node.Status.Conditions {
 			if c.Type == v1.NodeReady {
 				if c.Status == v1.ConditionTrue {
@@ -2479,8 +2512,25 @@ func (kl *Kubelet) fastStatusUpdateOnce() {
 				}
 			}
 		}
+
 		kl.updateRuntimeUp()
-		kl.syncNodeStatus()
+		updatedNode, changed := kl.updateNode(node)
+
+		if !changed {
+			kl.markVolumesFromNode(updatedNode)
+			node = updatedNode
+			continue
+		}
+
+		patchedNode, err := kl.patchNodeStatus(node, updatedNode)
+		if err != nil {
+			// node is probably stale. Set it to nil to request re-fetch.
+			node = nil
+			continue
+		}
+
+		kl.markVolumesFromNode(patchedNode)
+		node = patchedNode
 	}
 }
 
